@@ -197,7 +197,7 @@ def test_performance():
     torch.manual_seed(42)
     
     configs = [
-        (2, 64, 64),
+        (2, 32, 64),
         (4, 256, 64),
         (2, 1024, 64),
         (2, 2048, 64),
