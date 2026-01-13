@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import time
-from kernel_associative import ssm_forward_triton
+from kernel_associative import ssm_forward_triton, ssm_scan
 
 def ssm_forward_naive(log_A: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
