@@ -1,87 +1,8 @@
 
-
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# -------------------------
-# 1) Multi-Head SSM Mixer
-#    Treat it like MultiheadAttention: (B,T,D) -> (B,T,D)
-# -------------------------
-class MultiHeadSSM(nn.Module):
-    """
-    Minimal multi-head SSM mixer.
-
-    Input:  x (B, T, D)
-    Output: y (B, T, D)
-
-    Idea (per head, per channel):
-        s_t = a_t * s_{t-1} + x_t
-        where a_t = exp(dt_t * A), A < 0 for stability, dt_t > 0
-    """
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
-        super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-
-        # (Optional but useful) input/output projections, like MHA has
-        self.in_proj = nn.Linear(d_model, d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
-
-        # Stable continuous-time A: A = -exp(log_A)
-        # Per-head, per-channel A
-        self.log_A = nn.Parameter(torch.randn(n_heads, self.head_dim) * 0.02)
-
-        # dt projection: produce one dt per head per token (then broadcast to channels)
-        # dt > 0 by softplus
-        self.dt_proj = nn.Linear(d_model, n_heads, bias=True)
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor, state: torch.Tensor | None = None):
-        """
-        x: (B, T, D)
-        state (optional): (B, n_heads, head_dim) for streaming/inference
-        returns:
-            y: (B, T, D)
-            new_state: (B, n_heads, head_dim)
-        """
-        B, T, D = x.shape
-        x = self.in_proj(x)  # (B,T,D)
-
-        # reshape to heads
-        xh = x.view(B, T, self.n_heads, self.head_dim)  # (B,T,H,hd)
-
-        # A_continuous: (H,hd), negative
-        A_cont = -torch.exp(self.log_A)  # (H,hd)
-
-        # dt: (B,T,H), positive
-        dt = F.softplus(self.dt_proj(x))  # (B,T,H)
-
-        # a_t = exp(dt_t * A)  -> (B,T,H,hd)
-        # broadcast dt over head_dim
-        a = torch.exp(dt.unsqueeze(-1) * A_cont.unsqueeze(0).unsqueeze(0))
-
-        # init state
-        if state is None:
-            s = torch.zeros(B, self.n_heads, self.head_dim, device=x.device, dtype=x.dtype)
-        else:
-            s = state
-
-        ys = []
-        # O(T) scan (simple + correct). Later you can optimize without changing interface.
-        for t in range(T):
-            s = a[:, t] * s + xh[:, t]          # (B,H,hd)
-            ys.append(s)
-
-        y = torch.stack(ys, dim=1)              # (B,T,H,hd)
-        y = y.reshape(B, T, D)                  # (B,T,D)
-        y = self.out_proj(self.dropout(y))      # (B,T,D)
-
-        return y, s
 
 
 # -------------------------
