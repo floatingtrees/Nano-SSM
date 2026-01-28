@@ -65,7 +65,7 @@ def broadcast_parameters(models, devices):
             other_param.data.copy_(main_param.data.to(device))
 
 
-def train_step(models, devices, streams, data_batches, optimizer, criterion):
+def train_step(models, devices, streams, data_batches, optimizer, criterion, scheduler=None):
     num_gpus = len(devices)
     assert len(models) == num_gpus
     assert len(data_batches) == num_gpus
@@ -101,6 +101,8 @@ def train_step(models, devices, streams, data_batches, optimizer, criterion):
 
     average_gradients(models, devices)
     optimizer.step()
+    if scheduler is not None:
+        scheduler.step()
     broadcast_parameters(models, devices)
 
     return {
@@ -219,6 +221,7 @@ def test_training_loop():
     # Create optimizer and loss function
     optimizer = torch.optim.Adam(models[0].parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss()
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
     
     # Run training steps
     print("\n" + "=" * 60)
@@ -238,7 +241,8 @@ def test_training_loop():
             streams=streams,
             data_batches=data_batches,
             optimizer=optimizer,
-            criterion=criterion
+            criterion=criterion,
+            scheduler=scheduler
         )
         
         # Verify shapes
@@ -287,7 +291,6 @@ def test_training_loop():
     print("\n" + "=" * 60)
     print("✓ All tests passed!")
     print("=" * 60)
-
 
 
 if __name__ == "__main__":
