@@ -37,7 +37,8 @@ class TokenizerDataLoader:
                  tokenizer_name: str = "gpt2",
                  max_length: int = 1024,
                  data_input: Optional[str] = None,
-                 tokenizer_args: Optional[dict] = None):
+                 tokenizer_args: Optional[dict] = None,
+                 vocab_size: Optional[int] = None):
         if tokenizer_type != "hf":
             raise NotImplementedError("Only 'hf' tokenizer_type supported in prototype")
 
@@ -47,9 +48,22 @@ class TokenizerDataLoader:
         tokenizer_args = tokenizer_args or {}
         self.tokenizer_type = tokenizer_type
         self.tokenizer_name = tokenizer_name
+        self.vocab_size = vocab_size
         self.max_length = int(max_length)
         self.data_input = data_input
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **tokenizer_args)
+
+        # allow overriding vocab size (useful when model vocab differs from HF tokenizer)
+        if vocab_size is not None:
+            self.vocab_size = int(vocab_size)
+        else:
+            # try to infer from tokenizer
+            self.vocab_size = getattr(self.tokenizer, "vocab_size", None)
+            if self.vocab_size is None:
+                try:
+                    self.vocab_size = len(self.tokenizer.get_vocab())
+                except Exception:
+                    self.vocab_size = None
 
 
         #not used for now
@@ -264,6 +278,10 @@ class TokenizerDataLoader:
                 seq = torch.tensor(ids[0], dtype=torch.long)
             else:
                 seq = ids[0].detach().cpu().to(torch.long)
+
+            # normalize token ids to be within [0, vocab_size-1] to avoid out-of-bounds
+            if getattr(self, "vocab_size", None) is not None:
+                seq = torch.clamp(seq, min=0, max=self.vocab_size - 1)
 
             # only accept sequences of exact desired length
             if seq.size(0) != seq_len:

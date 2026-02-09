@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
 import copy
-import os
-from data.tokenizer_dataloader_prototype import TokenizerDataLoader
 from torch.cuda import Stream
 from einops import repeat
 import os
 from typing import List
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from data.tokenizer_dataloader_prototype import TokenizerDataLoader
 
 
 def get_available_gpus():
