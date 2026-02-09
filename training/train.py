@@ -310,12 +310,6 @@ def test_training_loop():
     # print(f"  Per-GPU batch size: {batch_size}, seq_len: {seq_len}")
     # print(f"  Expected model output shape: (batch={batch_size}, seq_len={seq_len}, vocab_size={vocab_size})")   
 
-if __name__ == "__main__":
-    test_training_loop()
-    # to run the live-tokenization test call:
-    # test_training_live_tokenization()
-
-
 def test_training_live_tokenization():
     """Run a small training test that retokenizes the local text per epoch.
 
@@ -371,7 +365,8 @@ def test_training_live_tokenization():
         print("Aborting live-tokenization test")
         return
 
-    dl = TokenizerDataLoader(tokenizer_name="gpt2", max_length=seq_len, data_input=sample)
+    dl = TokenizerDataLoader(tokenizer_name="gpt2", max_length=seq_len, data_input=sample, vocab_size=vocab_size)
+    print("Initialized dl with vocab_size: ", dl.vocab_size)
 
     optimizer = torch.optim.Adam(models[0].parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss()
@@ -412,3 +407,11 @@ def test_training_live_tokenization():
                 break
 
         print(f"Finished epoch {epoch+1}, steps run: {step}")
+
+
+if __name__ == "__main__":
+    test_training_loop()
+    # to run the live-tokenization test call:
+    # test_training_live_tokenization()
+
+
