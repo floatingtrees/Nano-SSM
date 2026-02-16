@@ -3,7 +3,6 @@ import torch.nn as nn
 import copy
 from torch.cuda import Stream
 from einops import repeat
-from einops import repeat
 
 def get_available_gpus():
     if not torch.cuda.is_available():
@@ -109,6 +108,46 @@ def train_step(models, devices, streams, data_batches, optimizer, criterion, sch
         "losses": [l.item() for l in losses], 
         "outputs": outputs
     }
+
+def training_loop( model, dataloader, optimizer, scheduler, num_epochs, criterion):
+
+    devices = get_available_gpus()
+    num_gpus = len(devices)
+    models = create_model_replicas(model, devices)
+    streams = create_cuda_streams(devices)
+    
+    history = {"train_loss": [], "learning_rates": []}
+    
+    for epoch in range(num_epochs):
+        epoch_losses = []
+        
+        for batch in dataloader:
+            if isinstance(batch, torch.Tensor):
+                batch_size_actual = batch.shape[0]
+                per_gpu_size = batch_size_actual // num_gpus
+                data_batches = [batch[i*per_gpu_size:(i+1)*per_gpu_size] for i in range(num_gpus)]
+                if batch_size_actual % num_gpus != 0:
+                    data_batches[-1] = batch[num_gpus*per_gpu_size:]
+            else:
+                data_batches = batch[:num_gpus]
+            
+            result = train_step(
+                models=models,
+                devices=devices,
+                streams=streams,
+                data_batches=data_batches,
+                optimizer=optimizer,
+                criterion=criterion,
+                scheduler=scheduler
+            )
+            
+            epoch_losses.extend(result["losses"])
+        
+        avg_epoch_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
+        history["train_loss"].append(avg_epoch_loss)
+        history["learning_rates"].append(optimizer.param_groups[0]['lr'])
+    
+    return history
 
 
 def test_training_loop():
@@ -293,5 +332,45 @@ def test_training_loop():
     print("=" * 60)
 
 
+
 if __name__ == "__main__":
-    test_training_loop()
+    
+    lr = 3e-4
+    weight_decay = 0.1
+    eps = 1e-8
+    num_epochs = 10
+    num_warmup_steps = 1000
+    num_decay_steps = 1_000_000
+
+    
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=lr, 
+        weight_decay=weight_decay, eps=eps
+    )
+
+
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.01,
+        total_iters=num_warmup_steps
+    )
+
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_decay_steps - num_warmup_steps
+    )
+
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[num_warmup_steps]
+    )
+
+    criterion = nn.CrossEntropyLoss()
+
+    
+    training_loop(model, dataloader, optimizer, scheduler, num_epochs, criterion)
+    
+    test_training_loop() 
