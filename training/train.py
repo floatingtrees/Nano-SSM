@@ -240,11 +240,52 @@ def training_loop( model, dataloader, optimizer, scheduler, num_epochs, criterio
                     filtered_kwargs[k] = opt_defaults[k]
 
         optimizer = OptimClass(models[0].parameters(), **filtered_kwargs)
-        try:
-            if scheduler is not None:
-                scheduler.optimizer = optimizer
-        except Exception:
-            print("Warning: could not rebind scheduler to new optimizer automatically.")
+        # Recreate scheduler(s) to attach to the new optimizer when possible
+        if scheduler is not None:
+            try:
+                import torch.optim.lr_scheduler as lr_sched
+
+                # helper to recreate LinearLR and CosineAnnealingLR from common attrs
+                def _recreate_sched(s):
+                    cls = s.__class__
+                    if isinstance(s, lr_sched.LinearLR):
+                        return lr_sched.LinearLR(optimizer,
+                                                  start_factor=getattr(s, 'start_factor', 0.01),
+                                                  total_iters=getattr(s, 'total_iters', 100))
+                    if isinstance(s, lr_sched.CosineAnnealingLR):
+                        return lr_sched.CosineAnnealingLR(optimizer,
+                                                          T_max=getattr(s, 'T_max', getattr(s, 't_max', 100)))
+                    # fallback: attempt to call constructor with any matching attributes
+                    try:
+                        sig = inspect.signature(cls.__init__)
+                        accepted = set(sig.parameters.keys()) - {'self', 'optimizer', 'args', 'kwargs'}
+                        kwargs = {k: getattr(s, k) for k in accepted if hasattr(s, k)}
+                        return cls(optimizer, **kwargs)
+                    except Exception:
+                        raise
+
+                if isinstance(scheduler, lr_sched.SequentialLR):
+                    old_scheds = getattr(scheduler, 'schedulers', None) or []
+                    old_milestones = getattr(scheduler, 'milestones', None)
+                    new_scheds = []
+                    for s in old_scheds:
+                        try:
+                            new_scheds.append(_recreate_sched(s))
+                        except Exception:
+                            # fallback to a basic LinearLR if one fails
+                            new_scheds.append(lr_sched.LinearLR(optimizer, start_factor=0.01, total_iters=100))
+                    if old_milestones is not None:
+                        scheduler = lr_sched.SequentialLR(optimizer, schedulers=new_scheds, milestones=old_milestones)
+                    else:
+                        scheduler = lr_sched.SequentialLR(optimizer, schedulers=new_scheds, milestones=[getattr(scheduler, 'milestones', 100)])
+                else:
+                    try:
+                        scheduler = _recreate_sched(scheduler)
+                    except Exception:
+                        print("Warning: could not recreate scheduler; leaving original scheduler (it may warn).")
+            except Exception:
+                print("Warning: could not rebind/recreate scheduler to new optimizer automatically.")
+
         print("Recreated optimizer on replica parameters.")
     except Exception as e:
         print(f"Warning: failed to recreate optimizer on replica parameters: {e}")
