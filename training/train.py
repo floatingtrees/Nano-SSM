@@ -6,8 +6,10 @@ from einops import repeat
 import os
 from typing import List
 import sys
+import inspect
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from data.tokenizer_dataloader_prototype import TokenizerDataLoader
+
 
 
 def get_available_gpus():
@@ -105,7 +107,11 @@ def train_step(models, devices, streams, data_batches, optimizer, criterion, sch
         s.synchronize()
 
     average_gradients(models, devices)
+    
+
     optimizer.step()
+
+
     if scheduler is not None:
         scheduler.step()
     broadcast_parameters(models, devices)
@@ -115,19 +121,66 @@ def train_step(models, devices, streams, data_batches, optimizer, criterion, sch
         "outputs": outputs
     }
 
-def training_loop( model, dataloader, optimizer, scheduler, num_epochs, criterion):
+def create_optimizer_from_config(opt_config, params):
+    import torch.optim as optim
+    typ = opt_config.get('type', 'AdamW')
+    kwargs = opt_config.get('kwargs', {})
+    Optim = getattr(optim, typ, None)
+    if Optim is None:
+        raise ValueError(f"Unknown optimizer type: {typ}")
+    return Optim(params, **kwargs)
+
+
+def create_scheduler_from_config(sched_config, optimizer):
+    import torch.optim.lr_scheduler as lr_sched
+    if sched_config is None:
+        return None
+    typ = sched_config.get('type')
+    if typ == 'sequential':
+        scheds = []
+        for s in sched_config.get('schedulers', []):
+            if s.get('type') == 'linear':
+                kwargs = s.get('kwargs', {})
+                scheds.append(lr_sched.LinearLR(optimizer, **kwargs))
+            elif s.get('type') == 'cosine':
+                kwargs = s.get('kwargs', {})
+                scheds.append(lr_sched.CosineAnnealingLR(optimizer, **kwargs))
+            else:
+                cls = getattr(lr_sched, s.get('type'), None)
+                if cls is not None:
+                    scheds.append(cls(optimizer, **s.get('kwargs', {})))
+        milestones = sched_config.get('milestones')
+        return lr_sched.SequentialLR(optimizer, schedulers=scheds, milestones=milestones)
+    elif typ == 'linear':
+        return lr_sched.LinearLR(optimizer, **sched_config.get('kwargs', {}))
+    elif typ == 'cosine':
+        return lr_sched.CosineAnnealingLR(optimizer, **sched_config.get('kwargs', {}))
+    else:
+        cls = getattr(lr_sched, typ, None)
+        if cls is None:
+            raise ValueError(f"Unknown scheduler type: {typ}")
+        return cls(optimizer, **sched_config.get('kwargs', {}))
+
+
+def training_loop( model, dataloader, optimizer_config, scheduler_config, num_epochs, criterion):
 
     devices = get_available_gpus()
     num_gpus = len(devices)
     models = create_model_replicas(model, devices)
     streams = create_cuda_streams(devices)
+    # Create optimizer and scheduler on replica parameters from provided configs
+    optimizer = create_optimizer_from_config(optimizer_config, params=models[0].parameters())
+    try:
+        scheduler = create_scheduler_from_config(scheduler_config, optimizer)
+    except Exception:
+        print("Warning: could not create scheduler from config; proceeding without scheduler.")
     
     history = {"train_loss": [], "learning_rates": []}
     
     for epoch in range(num_epochs):
         epoch_losses = []
-        
-        for batch in dataloader:
+        tokenGenerator = dataloader.tokenize_batches(seq_len=dataloader.max_length, drop_last=True, return_tensors='pt')
+        for batch in tokenGenerator:
             if isinstance(batch, torch.Tensor):
                 batch_size_actual = batch.shape[0]
                 per_gpu_size = batch_size_actual // num_gpus
@@ -350,104 +403,6 @@ def test_training_loop():
     # print(f"  Per-GPU batch size: {batch_size}, seq_len: {seq_len}")
     # print(f"  Expected model output shape: (batch={batch_size}, seq_len={seq_len}, vocab_size={vocab_size})")   
 
-def test_training_live_tokenization():
-    """Run a small training test that retokenizes the local text per epoch.
-
-    This function builds the same tiny SSM model setup as `test_training_loop`,
-    but it initializes a `TokenizerDataLoader` before the epoch loop and
-    uses `tokenize_file_chunks` to stream sequences (retokenized each epoch).
-    """
-    print("\nRunning live-tokenization training test")
-
-    devices = get_available_gpus()
-    num_gpus = len(devices)
-    if num_gpus < 1:
-        raise RuntimeError("Need at least 1 GPU for testing")
-
-    vocab_size = 1000
-    hidden_dim = 32
-    seq_len = 32
-
-    # Reuse the same SimpleSSMModel class definition from test_training_loop
-    class SimpleSSMModel(nn.Module):
-        def __init__(self, vocab_size, hidden_dim):
-            super().__init__()
-            self.vocab_size = vocab_size
-            self.hidden_dim = hidden_dim
-            self.embedding = nn.Embedding(vocab_size, hidden_dim)
-            self.A = nn.Parameter((torch.randn(hidden_dim) * 0.02).clamp(min=1e-6))
-            self.output = nn.Linear(hidden_dim, vocab_size)
-
-        def forward(self, x):
-            batch_size, seq_len = x.shape
-            x_emb = self.embedding(x)
-            A = repeat(self.A, "dim -> b seq dim", b=batch_size, seq=seq_len)
-            log_A = torch.log(A.clamp(min=1e-6))
-            cs_A = torch.cumsum(log_A, dim=1)
-            log_M = cs_A.unsqueeze(2) - cs_A.unsqueeze(1)
-            indices = torch.arange(seq_len, device=x.device)
-            mask = indices[:, None] >= indices[None, :]
-            log_M = log_M.masked_fill(~mask.unsqueeze(0).unsqueeze(-1), float('-inf'))
-            M = torch.exp(log_M)
-            out = torch.einsum('b t j d, b j d -> b t d', M, x_emb)
-            logits = self.output(out)
-            return logits
-
-    # create models/replicas/streams
-    base_model = SimpleSSMModel(vocab_size, hidden_dim)
-    models = create_model_replicas(base_model, devices)
-    streams = create_cuda_streams(devices)
-
-    # dataloader: initialize before epoch loop
-    sample = os.path.join(os.path.dirname(__file__), '..', 'sample.txt')
-    if not os.path.isfile(sample):
-        print("No local sample file found at", sample)
-        print("Aborting live-tokenization test")
-        return
-
-    dl = TokenizerDataLoader(tokenizer_name="gpt2", max_length=seq_len, data_input=sample, vocab_size=vocab_size)
-    print("Initialized dl with vocab_size: ", dl.vocab_size)
-
-    optimizer = torch.optim.Adam(models[0].parameters(), lr=1e-3)
-    criterion = nn.CrossEntropyLoss()
-    scheduler = None
-
-    per_gpu_batch = 4
-    needed = per_gpu_batch * num_gpus
-
-    num_epochs = 2
-    max_steps_per_epoch = 5
-    batch_gen = dl.tokenize_batches(seq_len=seq_len, global_batch_size=needed, drop_last=True, return_tensors='pt')
-    for epoch in range(num_epochs):
-        print(f"\nEpoch {epoch+1}/{num_epochs} (live tokenization)")
-        step = 0
-
-        for batch in batch_gen:
-            # Split global batch into per-GPU batches
-            data_batches = []
-            for i in range(num_gpus):
-                start = i * per_gpu_batch
-                end = start + per_gpu_batch
-                data_batches.append(batch[start:end])
-
-            # Training step
-            result = train_step(models=models,
-                                devices=devices,
-                                streams=streams,
-                                data_batches=data_batches,
-                                optimizer=optimizer,
-                                criterion=criterion,
-                                scheduler=scheduler)
-
-            avg_loss = sum(result['losses']) / len(result['losses'])
-            print(f"  Epoch {epoch+1} Step {step+1}: avg_loss={avg_loss:.4f}")
-
-            step += 1
-            if step >= max_steps_per_epoch:
-                break
-
-        print(f"Finished epoch {epoch+1}, steps run: {step}")
-
 
 
 if __name__ == "__main__":
@@ -461,37 +416,69 @@ if __name__ == "__main__":
 
     
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=lr, 
-        weight_decay=weight_decay, eps=eps
-    )
+    # Create a small default model and a simple synthetic dataloader so
+    # this script can run directly. Wrap the model to return logits only
+    # (some model implementations return (logits, states)).
+    from model.model import SSMTransformerLM
+
+    vocab_size = 1000
+    seq_len = 32
+    d_model = 128
+    n_layers = 2
+
+    class LogitsOnlyWrapper(nn.Module):
+        def __init__(self, base_model: nn.Module):
+            super().__init__()
+            self.base = base_model
+
+        def forward(self, x):
+            out = self.base(x)
+            # If the base model returns (logits, states), return logits
+            if isinstance(out, tuple) or isinstance(out, list):
+                return out[0]
+            return out
+
+    # instantiate base model and wrapper
+    base_model = SSMTransformerLM(vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, n_heads=8, max_seq_len=seq_len)
+    model = LogitsOnlyWrapper(base_model)
 
 
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.01,
-        total_iters=num_warmup_steps
-    )
+    # Use TokenizerDataLoader for live tokenization from sample.txt
+    sample_path = os.path.join(os.path.dirname(__file__), '..', 'sample.txt')
+    if not os.path.isfile(sample_path):
+        raise FileNotFoundError(f"sample.txt not found at {sample_path}")
+    global_batch_size = 4
+    dl = TokenizerDataLoader(tokenizer_name="gpt2", max_length=seq_len, data_input=sample_path, vocab_size=vocab_size, global_batch_size=global_batch_size)
+    
+    
 
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=num_decay_steps - num_warmup_steps
-    )
+    # Instead of creating optimizer/scheduler on the CPU model, build configs
+    # that can be instantiated on the replica parameters inside training_loop.
+    optimizer_config = {
+        'type': 'AdamW',
+        'kwargs': {
+            'lr': lr,
+            'weight_decay': weight_decay,
+            'eps': eps
+        }
+    }
 
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[num_warmup_steps]
-    )
+    scheduler_config = {
+        'type': 'sequential',
+        'schedulers': [
+            {'type': 'linear', 'kwargs': {'start_factor': 0.01, 'total_iters': num_warmup_steps}},
+            {'type': 'cosine', 'kwargs': {'T_max': num_decay_steps - num_warmup_steps}}
+        ],
+        'milestones': [num_warmup_steps]
+    }
 
     criterion = nn.CrossEntropyLoss()
 
+    #training_loop now takes in optimizer and scheduler CONFIGS, not optimizer and scheduler objects
+    #the objecs are crated within the loop based on model replicas to ensure the optimizer and scheduler are applied to the correct model (GPU)
+    output = training_loop(model, dl, optimizer_config, scheduler_config, num_epochs, criterion)
+    #print out loss & lr to confirm functionality of training_loop on sample.txt
+    print(output)
     
-    training_loop(model, dataloader, optimizer, scheduler, num_epochs, criterion)
-    
-    test_training_loop() 
-    # to run the live-tokenization test call:
-    # test_training_live_tokenization()
 
 
