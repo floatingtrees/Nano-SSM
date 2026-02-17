@@ -217,22 +217,22 @@ def training_loop( model, dataloader, optimizer, scheduler, num_epochs, criterio
     num_gpus = len(devices)
     models = create_model_replicas(model, devices)
     streams = create_cuda_streams(devices)
-    # Ensure optimizer targets the replica parameters (self-heal)
+    # Replace optimizer with a fresh optimizer bound to the replica parameters.
+    # This is simpler and more robust than trying to copy optimizer.state across
+    # parameter identity changes.
     try:
-        opt_first = optimizer.param_groups[0]['params'][0]
-        replica_first = next(models[0].parameters())
-        if opt_first.device != replica_first.device:
-            print("Optimizer parameters are not on replica device — realigning optimizer to replica.")
-            optimizer = realign_optimizer_to_replicas(optimizer, models)
-            # If a scheduler was provided, attempt to rebind its optimizer
-            try:
-                if scheduler is not None:
-                    scheduler.optimizer = optimizer
-            except Exception:
-                print("Warning: could not rebind scheduler to new optimizer automatically.")
-    except Exception:
-        # If anything goes wrong, skip realignment and let user handle it
-        pass
+        OptimClass = optimizer.__class__
+        opt_defaults = getattr(optimizer, 'defaults', {}) or {}
+        optimizer = OptimClass(models[0].parameters(), **opt_defaults)
+        try:
+            if scheduler is not None:
+                # Many schedulers store a reference to optimizer; rebind if possible
+                scheduler.optimizer = optimizer
+        except Exception:
+            print("Warning: could not rebind scheduler to new optimizer automatically.")
+        print("Recreated optimizer on replica parameters.")
+    except Exception as e:
+        print(f"Warning: failed to recreate optimizer on replica parameters: {e}")
     
     history = {"train_loss": [], "learning_rates": []}
     
