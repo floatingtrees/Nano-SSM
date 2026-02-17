@@ -9,6 +9,9 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from data.tokenizer_dataloader_prototype import TokenizerDataLoader
 
+# one-time diagnostic flag
+_diag_first_step_logged = False
+
 
 def get_available_gpus():
     if not torch.cuda.is_available():
@@ -172,7 +175,33 @@ def train_step(models, devices, streams, data_batches, optimizer, criterion, sch
         s.synchronize()
 
     average_gradients(models, devices)
+    # diagnostic: one-time check that optimizer actually updates replica params
+    global _diag_first_step_logged
+    if not _diag_first_step_logged:
+        try:
+            main_params = list(models[0].parameters())
+            before_param = main_params[0].data.clone()
+            total_grad_norm = 0.0
+            for p in main_params:
+                if p.grad is not None:
+                    total_grad_norm += float(p.grad.detach().to('cpu').norm().item())
+            print(f"[diag] total grad norm (main replica): {total_grad_norm:.6f}")
+        except Exception:
+            before_param = None
+
     optimizer.step()
+
+    if not _diag_first_step_logged:
+        try:
+            if before_param is not None:
+                main_params = list(models[0].parameters())
+                after_param = main_params[0].data
+                delta = float((after_param - before_param).abs().sum().item())
+                print(f"[diag] main_param[0] abs delta after step: {delta:.6e}")
+        except Exception:
+            pass
+        _diag_first_step_logged = True
+
     if scheduler is not None:
         scheduler.step()
     broadcast_parameters(models, devices)
