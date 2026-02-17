@@ -38,7 +38,8 @@ class TokenizerDataLoader:
                  max_length: int = 1024,
                  data_input: Optional[str] = None,
                  tokenizer_args: Optional[dict] = None,
-                 vocab_size: Optional[int] = None):
+                 vocab_size: Optional[int] = None,
+                 global_batch_size: int = 4):
         if tokenizer_type != "hf":
             raise NotImplementedError("Only 'hf' tokenizer_type supported in prototype")
 
@@ -52,6 +53,7 @@ class TokenizerDataLoader:
         self.max_length = int(max_length)
         self.data_input = data_input
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **tokenizer_args)
+        self.global_batch_size = global_batch_size
 
         # allow overriding vocab size (useful when model vocab differs from HF tokenizer)
         if vocab_size is not None:
@@ -66,7 +68,7 @@ class TokenizerDataLoader:
                     self.vocab_size = None
 
 
-        #not used for now
+        #not used for now, since caching isn't fully integrated
         # Caching / sharding attributes
         self.cache_enabled: bool = False
         self.shard_dir: Optional[str] = None
@@ -239,7 +241,6 @@ class TokenizerDataLoader:
     def tokenize_batches(self,
                          file_path: Optional[str] = None,
                          seq_len: int = 512,
-                         global_batch_size: int = 32,
                          overlap_tokens: int = 0,
                          file_mode: str = "lines",
                          skip_blank: bool = True,
@@ -289,25 +290,26 @@ class TokenizerDataLoader:
 
             buffer.append(seq)
 
-            if len(buffer) >= global_batch_size:
-                batch = torch.stack(buffer[:global_batch_size], dim=0)
+            if len(buffer) >= self.global_batch_size:
+                batch = torch.stack(buffer[:self.global_batch_size], dim=0)
                 if pin_memory:
                     batch = batch.pin_memory()
                 yield batch
-                buffer = buffer[global_batch_size:]
+                buffer = buffer[self.global_batch_size:]
 
         # flush remaining buffer
         if buffer:
             if drop_last:
                 return
             # pad by repeating last element
-            while len(buffer) < global_batch_size:
+            while len(buffer) < self.global_batch_size:
                 buffer.append(buffer[-1].clone())
-            batch = torch.stack(buffer[:global_batch_size], dim=0)
+            batch = torch.stack(buffer[:self.global_batch_size], dim=0)
             if pin_memory:
                 batch = batch.pin_memory()
             yield batch
 
+    #caching not used, so ignore this for now
     # ---------------- Cache / Shard helpers ----------------
     def create_cache(self,
                      shard_dir: Union[str, Path],

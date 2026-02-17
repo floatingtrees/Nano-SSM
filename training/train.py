@@ -126,7 +126,7 @@ def training_loop( model, dataloader, optimizer, scheduler, num_epochs, criterio
     
     for epoch in range(num_epochs):
         epoch_losses = []
-        
+        dataloader = dataloader.tokenize_batches(seq_len=dataloader.max_length, drop_last=True, return_tensors='pt')
         for batch in dataloader:
             if isinstance(batch, torch.Tensor):
                 batch_size_actual = batch.shape[0]
@@ -492,10 +492,10 @@ if __name__ == "__main__":
     sample_path = os.path.join(os.path.dirname(__file__), '..', 'sample.txt')
     if not os.path.isfile(sample_path):
         raise FileNotFoundError(f"sample.txt not found at {sample_path}")
-
-    dl = TokenizerDataLoader(tokenizer_name="gpt2", max_length=seq_len, data_input=sample_path, vocab_size=vocab_size)
     global_batch_size = 4
-    dataloader = dl.tokenize_batches(seq_len=seq_len, global_batch_size=global_batch_size, drop_last=True, return_tensors='pt')
+    dl = TokenizerDataLoader(tokenizer_name="gpt2", max_length=seq_len, data_input=sample_path, vocab_size=vocab_size, global_batch_size=global_batch_size)
+    
+    
 
     optimizer = torch.optim.AdamW(
         model.parameters(), 
@@ -524,7 +524,9 @@ if __name__ == "__main__":
     criterion = nn.CrossEntropyLoss()
 
     
-    training_loop(model, dataloader, optimizer, scheduler, num_epochs, criterion)
+    output = training_loop(model, dl, optimizer, scheduler, num_epochs, criterion)
+    #print out loss & lr to confirm functionality of training_loop on sample.txt
+    print(output)
     
     # test_training_loop() 
     # to run the live-tokenization test call:
