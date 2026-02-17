@@ -6,6 +6,7 @@ from einops import repeat
 import os
 from typing import List
 import sys
+import inspect
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from data.tokenizer_dataloader_prototype import TokenizerDataLoader
 
@@ -223,10 +224,24 @@ def training_loop( model, dataloader, optimizer, scheduler, num_epochs, criterio
     try:
         OptimClass = optimizer.__class__
         opt_defaults = getattr(optimizer, 'defaults', {}) or {}
-        optimizer = OptimClass(models[0].parameters(), **opt_defaults)
+
+        # Filter opt_defaults to only kwargs accepted by OptimClass.__init__
+        try:
+            sig = inspect.signature(OptimClass.__init__)
+            accepted = set(sig.parameters.keys()) - {"self", "params", "args", "kwargs"}
+            filtered_kwargs = {k: v for k, v in opt_defaults.items() if k in accepted}
+        except Exception:
+            filtered_kwargs = {}
+
+        # Fallback: common optimizer args (Adam/AdamW)
+        if not filtered_kwargs:
+            for k in ("lr", "betas", "eps", "weight_decay", "amsgrad"): 
+                if k in opt_defaults:
+                    filtered_kwargs[k] = opt_defaults[k]
+
+        optimizer = OptimClass(models[0].parameters(), **filtered_kwargs)
         try:
             if scheduler is not None:
-                # Many schedulers store a reference to optimizer; rebind if possible
                 scheduler.optimizer = optimizer
         except Exception:
             print("Warning: could not rebind scheduler to new optimizer automatically.")
