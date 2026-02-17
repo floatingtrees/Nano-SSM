@@ -212,83 +212,59 @@ def train_step(models, devices, streams, data_batches, optimizer, criterion, sch
         "outputs": outputs
     }
 
-def training_loop( model, dataloader, optimizer, scheduler, num_epochs, criterion):
+def create_optimizer_from_config(opt_config, params):
+    import torch.optim as optim
+    typ = opt_config.get('type', 'AdamW')
+    kwargs = opt_config.get('kwargs', {})
+    Optim = getattr(optim, typ, None)
+    if Optim is None:
+        raise ValueError(f"Unknown optimizer type: {typ}")
+    return Optim(params, **kwargs)
+
+
+def create_scheduler_from_config(sched_config, optimizer):
+    import torch.optim.lr_scheduler as lr_sched
+    if sched_config is None:
+        return None
+    typ = sched_config.get('type')
+    if typ == 'sequential':
+        scheds = []
+        for s in sched_config.get('schedulers', []):
+            if s.get('type') == 'linear':
+                kwargs = s.get('kwargs', {})
+                scheds.append(lr_sched.LinearLR(optimizer, **kwargs))
+            elif s.get('type') == 'cosine':
+                kwargs = s.get('kwargs', {})
+                scheds.append(lr_sched.CosineAnnealingLR(optimizer, **kwargs))
+            else:
+                cls = getattr(lr_sched, s.get('type'), None)
+                if cls is not None:
+                    scheds.append(cls(optimizer, **s.get('kwargs', {})))
+        milestones = sched_config.get('milestones')
+        return lr_sched.SequentialLR(optimizer, schedulers=scheds, milestones=milestones)
+    elif typ == 'linear':
+        return lr_sched.LinearLR(optimizer, **sched_config.get('kwargs', {}))
+    elif typ == 'cosine':
+        return lr_sched.CosineAnnealingLR(optimizer, **sched_config.get('kwargs', {}))
+    else:
+        cls = getattr(lr_sched, typ, None)
+        if cls is None:
+            raise ValueError(f"Unknown scheduler type: {typ}")
+        return cls(optimizer, **sched_config.get('kwargs', {}))
+
+
+def training_loop( model, dataloader, optimizer_config, scheduler_config, num_epochs, criterion):
 
     devices = get_available_gpus()
     num_gpus = len(devices)
     models = create_model_replicas(model, devices)
     streams = create_cuda_streams(devices)
-    # Replace optimizer with a fresh optimizer bound to the replica parameters.
-    # This is simpler and more robust than trying to copy optimizer.state across
-    # parameter identity changes.
+    # Create optimizer and scheduler on replica parameters from provided configs
+    optimizer = create_optimizer_from_config(optimizer_config, params=models[0].parameters())
     try:
-        OptimClass = optimizer.__class__
-        opt_defaults = getattr(optimizer, 'defaults', {}) or {}
-
-        # Filter opt_defaults to only kwargs accepted by OptimClass.__init__
-        try:
-            sig = inspect.signature(OptimClass.__init__)
-            accepted = set(sig.parameters.keys()) - {"self", "params", "args", "kwargs"}
-            filtered_kwargs = {k: v for k, v in opt_defaults.items() if k in accepted}
-        except Exception:
-            filtered_kwargs = {}
-
-        # Fallback: common optimizer args (Adam/AdamW)
-        if not filtered_kwargs:
-            for k in ("lr", "betas", "eps", "weight_decay", "amsgrad"): 
-                if k in opt_defaults:
-                    filtered_kwargs[k] = opt_defaults[k]
-
-        optimizer = OptimClass(models[0].parameters(), **filtered_kwargs)
-        # Recreate scheduler(s) to attach to the new optimizer when possible
-        if scheduler is not None:
-            try:
-                import torch.optim.lr_scheduler as lr_sched
-
-                # helper to recreate LinearLR and CosineAnnealingLR from common attrs
-                def _recreate_sched(s):
-                    cls = s.__class__
-                    if isinstance(s, lr_sched.LinearLR):
-                        return lr_sched.LinearLR(optimizer,
-                                                  start_factor=getattr(s, 'start_factor', 0.01),
-                                                  total_iters=getattr(s, 'total_iters', 100))
-                    if isinstance(s, lr_sched.CosineAnnealingLR):
-                        return lr_sched.CosineAnnealingLR(optimizer,
-                                                          T_max=getattr(s, 'T_max', getattr(s, 't_max', 100)))
-                    # fallback: attempt to call constructor with any matching attributes
-                    try:
-                        sig = inspect.signature(cls.__init__)
-                        accepted = set(sig.parameters.keys()) - {'self', 'optimizer', 'args', 'kwargs'}
-                        kwargs = {k: getattr(s, k) for k in accepted if hasattr(s, k)}
-                        return cls(optimizer, **kwargs)
-                    except Exception:
-                        raise
-
-                if isinstance(scheduler, lr_sched.SequentialLR):
-                    old_scheds = getattr(scheduler, 'schedulers', None) or []
-                    old_milestones = getattr(scheduler, 'milestones', None)
-                    new_scheds = []
-                    for s in old_scheds:
-                        try:
-                            new_scheds.append(_recreate_sched(s))
-                        except Exception:
-                            # fallback to a basic LinearLR if one fails
-                            new_scheds.append(lr_sched.LinearLR(optimizer, start_factor=0.01, total_iters=100))
-                    if old_milestones is not None:
-                        scheduler = lr_sched.SequentialLR(optimizer, schedulers=new_scheds, milestones=old_milestones)
-                    else:
-                        scheduler = lr_sched.SequentialLR(optimizer, schedulers=new_scheds, milestones=[getattr(scheduler, 'milestones', 100)])
-                else:
-                    try:
-                        scheduler = _recreate_sched(scheduler)
-                    except Exception:
-                        print("Warning: could not recreate scheduler; leaving original scheduler (it may warn).")
-            except Exception:
-                print("Warning: could not rebind/recreate scheduler to new optimizer automatically.")
-
-        print("Recreated optimizer on replica parameters.")
-    except Exception as e:
-        print(f"Warning: failed to recreate optimizer on replica parameters: {e}")
+        scheduler = create_scheduler_from_config(scheduler_config, optimizer)
+    except Exception:
+        print("Warning: could not create scheduler from config; proceeding without scheduler.")
     
     history = {"train_loss": [], "learning_rates": []}
     
@@ -665,34 +641,29 @@ if __name__ == "__main__":
     
     
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=lr, 
-        weight_decay=weight_decay, eps=eps
-    )
+    # Instead of creating optimizer/scheduler on the CPU model, build configs
+    # that can be instantiated on the replica parameters inside training_loop.
+    optimizer_config = {
+        'type': 'AdamW',
+        'kwargs': {
+            'lr': lr,
+            'weight_decay': weight_decay,
+            'eps': eps
+        }
+    }
 
-
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.01,
-        total_iters=num_warmup_steps
-    )
-
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=num_decay_steps - num_warmup_steps
-    )
-
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[num_warmup_steps]
-    )
+    scheduler_config = {
+        'type': 'sequential',
+        'schedulers': [
+            {'type': 'linear', 'kwargs': {'start_factor': 0.01, 'total_iters': num_warmup_steps}},
+            {'type': 'cosine', 'kwargs': {'T_max': num_decay_steps - num_warmup_steps}}
+        ],
+        'milestones': [num_warmup_steps]
+    }
 
     criterion = nn.CrossEntropyLoss()
 
-    
-    output = training_loop(model, dl, optimizer, scheduler, num_epochs, criterion)
+    output = training_loop(model, dl, optimizer_config, scheduler_config, num_epochs, criterion)
     #print out loss & lr to confirm functionality of training_loop on sample.txt
     print(output)
     
