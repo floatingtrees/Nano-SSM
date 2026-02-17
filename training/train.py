@@ -10,8 +10,6 @@ import inspect
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from data.tokenizer_dataloader_prototype import TokenizerDataLoader
 
-# one-time diagnostic flag
-_diag_first_step_logged = False
 
 
 def get_available_gpus():
@@ -38,71 +36,71 @@ def create_cuda_streams(devices):
     return streams
 
 
-def realign_optimizer_to_replicas(optimizer, models):
-    """Recreate optimizer to point at `models[0]` parameters and copy state.
+# def realign_optimizer_to_replicas(optimizer, models):
+#     """Recreate optimizer to point at `models[0]` parameters and copy state.
 
-    This attempts to preserve optimizer hyperparameters and internal state
-    by mapping the original optimizer's parameter ordering to the new
-    replica parameters (assumes the parameter ordering is consistent).
-    Returns a new optimizer instance.
-    """
-    main_model = models[0]
-    new_params = list(main_model.parameters())
+#     This attempts to preserve optimizer hyperparameters and internal state
+#     by mapping the original optimizer's parameter ordering to the new
+#     replica parameters (assumes the parameter ordering is consistent).
+#     Returns a new optimizer instance.
+#     """
+#     main_model = models[0]
+#     new_params = list(main_model.parameters())
 
-    OptimClass = optimizer.__class__
+#     OptimClass = optimizer.__class__
 
-    # Collect old params in order
-    old_param_groups = optimizer.param_groups
-    old_params = [p for pg in old_param_groups for p in pg['params']]
+#     # Collect old params in order
+#     old_param_groups = optimizer.param_groups
+#     old_params = [p for pg in old_param_groups for p in pg['params']]
 
-    # If counts match, build new param_groups mirroring old groups but with new params
-    new_param_groups = []
-    if len(old_params) == len(new_params):
-        # map by position
-        mapping = {old: new for old, new in zip(old_params, new_params)}
-        for pg in old_param_groups:
-            new_pg = {k: v for k, v in pg.items() if k != 'params'}
-            new_pg['params'] = [mapping[p] for p in pg['params']]
-            new_param_groups.append(new_pg)
-    else:
-        # Fallback: single group with all new params
-        new_param_groups = [{'params': new_params}]
+#     # If counts match, build new param_groups mirroring old groups but with new params
+#     new_param_groups = []
+#     if len(old_params) == len(new_params):
+#         # map by position
+#         mapping = {old: new for old, new in zip(old_params, new_params)}
+#         for pg in old_param_groups:
+#             new_pg = {k: v for k, v in pg.items() if k != 'params'}
+#             new_pg['params'] = [mapping[p] for p in pg['params']]
+#             new_param_groups.append(new_pg)
+#     else:
+#         # Fallback: single group with all new params
+#         new_param_groups = [{'params': new_params}]
 
-    try:
-        new_optimizer = OptimClass(new_param_groups, **getattr(optimizer, 'defaults', {}))
-    except Exception:
-        # Last-resort: call with params only and then update groups' hyperparams
-        new_optimizer = OptimClass(new_params, **getattr(optimizer, 'defaults', {}))
-        try:
-            # copy hyperparameters into param groups if sizes match
-            for i, pg in enumerate(old_param_groups):
-                for k, v in pg.items():
-                    if k == 'params':
-                        continue
-                    if i < len(new_optimizer.param_groups):
-                        new_optimizer.param_groups[i][k] = v
-        except Exception:
-            pass
+#     try:
+#         new_optimizer = OptimClass(new_param_groups, **getattr(optimizer, 'defaults', {}))
+#     except Exception:
+#         # Last-resort: call with params only and then update groups' hyperparams
+#         new_optimizer = OptimClass(new_params, **getattr(optimizer, 'defaults', {}))
+#         try:
+#             # copy hyperparameters into param groups if sizes match
+#             for i, pg in enumerate(old_param_groups):
+#                 for k, v in pg.items():
+#                     if k == 'params':
+#                         continue
+#                     if i < len(new_optimizer.param_groups):
+#                         new_optimizer.param_groups[i][k] = v
+#         except Exception:
+#             pass
 
-    # Copy optimizer state mapping old params -> new params (by position)
-    try:
-        if len(old_params) == len(new_params):
-            for old_p, new_p in zip(old_params, new_params):
-                old_state = optimizer.state.get(old_p, None)
-                if old_state is None:
-                    continue
-                new_state = {}
-                for k, v in old_state.items():
-                    if torch.is_tensor(v):
-                        # move tensors to the device of the new param and clone
-                        new_state[k] = v.detach().to(new_p.device).clone()
-                    else:
-                        new_state[k] = v
-                new_optimizer.state[new_p] = new_state
-    except Exception:
-        pass
+#     # Copy optimizer state mapping old params -> new params (by position)
+#     try:
+#         if len(old_params) == len(new_params):
+#             for old_p, new_p in zip(old_params, new_params):
+#                 old_state = optimizer.state.get(old_p, None)
+#                 if old_state is None:
+#                     continue
+#                 new_state = {}
+#                 for k, v in old_state.items():
+#                     if torch.is_tensor(v):
+#                         # move tensors to the device of the new param and clone
+#                         new_state[k] = v.detach().to(new_p.device).clone()
+#                     else:
+#                         new_state[k] = v
+#                 new_optimizer.state[new_p] = new_state
+#     except Exception:
+#         pass
 
-    return new_optimizer
+#     return new_optimizer
 
 def average_gradients(models, devices):
     main_device = devices[0]
@@ -176,32 +174,10 @@ def train_step(models, devices, streams, data_batches, optimizer, criterion, sch
         s.synchronize()
 
     average_gradients(models, devices)
-    # diagnostic: one-time check that optimizer actually updates replica params
-    global _diag_first_step_logged
-    if not _diag_first_step_logged:
-        try:
-            main_params = list(models[0].parameters())
-            before_param = main_params[0].data.clone()
-            total_grad_norm = 0.0
-            for p in main_params:
-                if p.grad is not None:
-                    total_grad_norm += float(p.grad.detach().to('cpu').norm().item())
-            print(f"[diag] total grad norm (main replica): {total_grad_norm:.6f}")
-        except Exception:
-            before_param = None
+    
 
     optimizer.step()
 
-    if not _diag_first_step_logged:
-        try:
-            if before_param is not None:
-                main_params = list(models[0].parameters())
-                after_param = main_params[0].data
-                delta = float((after_param - before_param).abs().sum().item())
-                print(f"[diag] main_param[0] abs delta after step: {delta:.6e}")
-        except Exception:
-            pass
-        _diag_first_step_logged = True
 
     if scheduler is not None:
         scheduler.step()
@@ -494,104 +470,6 @@ def test_training_loop():
     # print(f"  Per-GPU batch size: {batch_size}, seq_len: {seq_len}")
     # print(f"  Expected model output shape: (batch={batch_size}, seq_len={seq_len}, vocab_size={vocab_size})")   
 
-def test_training_live_tokenization():
-    """Run a small training test that retokenizes the local text per epoch.
-
-    This function builds the same tiny SSM model setup as `test_training_loop`,
-    but it initializes a `TokenizerDataLoader` before the epoch loop and
-    uses `tokenize_file_chunks` to stream sequences (retokenized each epoch).
-    """
-    print("\nRunning live-tokenization training test")
-
-    devices = get_available_gpus()
-    num_gpus = len(devices)
-    if num_gpus < 1:
-        raise RuntimeError("Need at least 1 GPU for testing")
-
-    vocab_size = 1000
-    hidden_dim = 32
-    seq_len = 32
-
-    # Reuse the same SimpleSSMModel class definition from test_training_loop
-    class SimpleSSMModel(nn.Module):
-        def __init__(self, vocab_size, hidden_dim):
-            super().__init__()
-            self.vocab_size = vocab_size
-            self.hidden_dim = hidden_dim
-            self.embedding = nn.Embedding(vocab_size, hidden_dim)
-            self.A = nn.Parameter((torch.randn(hidden_dim) * 0.02).clamp(min=1e-6))
-            self.output = nn.Linear(hidden_dim, vocab_size)
-
-        def forward(self, x):
-            batch_size, seq_len = x.shape
-            x_emb = self.embedding(x)
-            A = repeat(self.A, "dim -> b seq dim", b=batch_size, seq=seq_len)
-            log_A = torch.log(A.clamp(min=1e-6))
-            cs_A = torch.cumsum(log_A, dim=1)
-            log_M = cs_A.unsqueeze(2) - cs_A.unsqueeze(1)
-            indices = torch.arange(seq_len, device=x.device)
-            mask = indices[:, None] >= indices[None, :]
-            log_M = log_M.masked_fill(~mask.unsqueeze(0).unsqueeze(-1), float('-inf'))
-            M = torch.exp(log_M)
-            out = torch.einsum('b t j d, b j d -> b t d', M, x_emb)
-            logits = self.output(out)
-            return logits
-
-    # create models/replicas/streams
-    base_model = SimpleSSMModel(vocab_size, hidden_dim)
-    models = create_model_replicas(base_model, devices)
-    streams = create_cuda_streams(devices)
-
-    # dataloader: initialize before epoch loop
-    sample = os.path.join(os.path.dirname(__file__), '..', 'sample.txt')
-    if not os.path.isfile(sample):
-        print("No local sample file found at", sample)
-        print("Aborting live-tokenization test")
-        return
-
-    dl = TokenizerDataLoader(tokenizer_name="gpt2", max_length=seq_len, data_input=sample, vocab_size=vocab_size)
-    print("Initialized dl with vocab_size: ", dl.vocab_size)
-
-    optimizer = torch.optim.Adam(models[0].parameters(), lr=1e-3)
-    criterion = nn.CrossEntropyLoss()
-    scheduler = None
-
-    per_gpu_batch = 4
-    needed = per_gpu_batch * num_gpus
-
-    num_epochs = 2
-    max_steps_per_epoch = 5
-    batch_gen = dl.tokenize_batches(seq_len=seq_len, global_batch_size=needed, drop_last=True, return_tensors='pt')
-    for epoch in range(num_epochs):
-        print(f"\nEpoch {epoch+1}/{num_epochs} (live tokenization)")
-        step = 0
-
-        for batch in batch_gen:
-            # Split global batch into per-GPU batches
-            data_batches = []
-            for i in range(num_gpus):
-                start = i * per_gpu_batch
-                end = start + per_gpu_batch
-                data_batches.append(batch[start:end])
-
-            # Training step
-            result = train_step(models=models,
-                                devices=devices,
-                                streams=streams,
-                                data_batches=data_batches,
-                                optimizer=optimizer,
-                                criterion=criterion,
-                                scheduler=scheduler)
-
-            avg_loss = sum(result['losses']) / len(result['losses'])
-            print(f"  Epoch {epoch+1} Step {step+1}: avg_loss={avg_loss:.4f}")
-
-            step += 1
-            if step >= max_steps_per_epoch:
-                break
-
-        print(f"Finished epoch {epoch+1}, steps run: {step}")
-
 
 
 if __name__ == "__main__":
@@ -663,12 +541,11 @@ if __name__ == "__main__":
 
     criterion = nn.CrossEntropyLoss()
 
+    #training_loop now takes in optimizer and scheduler CONFIGS, not optimizer and scheduler objects
+    #the objecs are crated within the loop based on model replicas to ensure the optimizer and scheduler are applied to the correct model (GPU)
     output = training_loop(model, dl, optimizer_config, scheduler_config, num_epochs, criterion)
     #print out loss & lr to confirm functionality of training_loop on sample.txt
     print(output)
     
-    # test_training_loop() 
-    # to run the live-tokenization test call:
-    # test_training_live_tokenization()
 
 
