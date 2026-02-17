@@ -461,6 +461,42 @@ if __name__ == "__main__":
 
     
 
+    # Create a small default model and a simple synthetic dataloader so
+    # this script can run directly. Wrap the model to return logits only
+    # (some model implementations return (logits, states)).
+    from model.model import SSMTransformerLM
+
+    vocab_size = 1000
+    seq_len = 32
+    d_model = 128
+    n_layers = 2
+
+    class LogitsOnlyWrapper(nn.Module):
+        def __init__(self, base_model: nn.Module):
+            super().__init__()
+            self.base = base_model
+
+        def forward(self, x):
+            out = self.base(x)
+            # If the base model returns (logits, states), return logits
+            if isinstance(out, tuple) or isinstance(out, list):
+                return out[0]
+            return out
+
+    # instantiate base model and wrapper
+    base_model = SSMTransformerLM(vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, n_heads=8, max_seq_len=seq_len)
+    model = LogitsOnlyWrapper(base_model)
+
+
+    # Use TokenizerDataLoader for live tokenization from sample.txt
+    sample_path = os.path.join(os.path.dirname(__file__), '..', 'sample.txt')
+    if not os.path.isfile(sample_path):
+        raise FileNotFoundError(f"sample.txt not found at {sample_path}")
+
+    dl = TokenizerDataLoader(tokenizer_name="gpt2", max_length=seq_len, data_input=sample_path, vocab_size=vocab_size)
+    global_batch_size = 4
+    dataloader = dl.tokenize_batches(seq_len=seq_len, global_batch_size=global_batch_size, drop_last=True, return_tensors='pt')
+
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=lr, 
@@ -490,7 +526,7 @@ if __name__ == "__main__":
     
     training_loop(model, dataloader, optimizer, scheduler, num_epochs, criterion)
     
-    test_training_loop() 
+    # test_training_loop() 
     # to run the live-tokenization test call:
     # test_training_live_tokenization()
 
