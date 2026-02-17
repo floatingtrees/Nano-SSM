@@ -33,6 +33,73 @@ def create_cuda_streams(devices):
             streams.append(stream)
     return streams
 
+
+def realign_optimizer_to_replicas(optimizer, models):
+    """Recreate optimizer to point at `models[0]` parameters and copy state.
+
+    This attempts to preserve optimizer hyperparameters and internal state
+    by mapping the original optimizer's parameter ordering to the new
+    replica parameters (assumes the parameter ordering is consistent).
+    Returns a new optimizer instance.
+    """
+    main_model = models[0]
+    new_params = list(main_model.parameters())
+
+    OptimClass = optimizer.__class__
+
+    # Collect old params in order
+    old_param_groups = optimizer.param_groups
+    old_params = [p for pg in old_param_groups for p in pg['params']]
+
+    # If counts match, build new param_groups mirroring old groups but with new params
+    new_param_groups = []
+    if len(old_params) == len(new_params):
+        # map by position
+        mapping = {old: new for old, new in zip(old_params, new_params)}
+        for pg in old_param_groups:
+            new_pg = {k: v for k, v in pg.items() if k != 'params'}
+            new_pg['params'] = [mapping[p] for p in pg['params']]
+            new_param_groups.append(new_pg)
+    else:
+        # Fallback: single group with all new params
+        new_param_groups = [{'params': new_params}]
+
+    try:
+        new_optimizer = OptimClass(new_param_groups, **getattr(optimizer, 'defaults', {}))
+    except Exception:
+        # Last-resort: call with params only and then update groups' hyperparams
+        new_optimizer = OptimClass(new_params, **getattr(optimizer, 'defaults', {}))
+        try:
+            # copy hyperparameters into param groups if sizes match
+            for i, pg in enumerate(old_param_groups):
+                for k, v in pg.items():
+                    if k == 'params':
+                        continue
+                    if i < len(new_optimizer.param_groups):
+                        new_optimizer.param_groups[i][k] = v
+        except Exception:
+            pass
+
+    # Copy optimizer state mapping old params -> new params (by position)
+    try:
+        if len(old_params) == len(new_params):
+            for old_p, new_p in zip(old_params, new_params):
+                old_state = optimizer.state.get(old_p, None)
+                if old_state is None:
+                    continue
+                new_state = {}
+                for k, v in old_state.items():
+                    if torch.is_tensor(v):
+                        # move tensors to the device of the new param and clone
+                        new_state[k] = v.detach().to(new_p.device).clone()
+                    else:
+                        new_state[k] = v
+                new_optimizer.state[new_p] = new_state
+    except Exception:
+        pass
+
+    return new_optimizer
+
 def average_gradients(models, devices):
     main_device = devices[0]
 
@@ -121,6 +188,22 @@ def training_loop( model, dataloader, optimizer, scheduler, num_epochs, criterio
     num_gpus = len(devices)
     models = create_model_replicas(model, devices)
     streams = create_cuda_streams(devices)
+    # Ensure optimizer targets the replica parameters (self-heal)
+    try:
+        opt_first = optimizer.param_groups[0]['params'][0]
+        replica_first = next(models[0].parameters())
+        if opt_first.device != replica_first.device:
+            print("Optimizer parameters are not on replica device — realigning optimizer to replica.")
+            optimizer = realign_optimizer_to_replicas(optimizer, models)
+            # If a scheduler was provided, attempt to rebind its optimizer
+            try:
+                if scheduler is not None:
+                    scheduler.optimizer = optimizer
+            except Exception:
+                print("Warning: could not rebind scheduler to new optimizer automatically.")
+    except Exception:
+        # If anything goes wrong, skip realignment and let user handle it
+        pass
     
     history = {"train_loss": [], "learning_rates": []}
     
