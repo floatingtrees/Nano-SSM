@@ -126,8 +126,8 @@ def training_loop( model, dataloader, optimizer, scheduler, num_epochs, criterio
     
     for epoch in range(num_epochs):
         epoch_losses = []
-        dataloader = dataloader.tokenize_batches(seq_len=dataloader.max_length, drop_last=True, return_tensors='pt')
-        for batch in dataloader:
+        tokenGenerator = dataloader.tokenize_batches(seq_len=dataloader.max_length, drop_last=True, return_tensors='pt')
+        for batch in tokenGenerator:
             if isinstance(batch, torch.Tensor):
                 batch_size_actual = batch.shape[0]
                 per_gpu_size = batch_size_actual // num_gpus
